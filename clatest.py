@@ -55,7 +55,32 @@ section[data-testid="stSidebar"] [data-baseweb="input"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Helper Functions ───────────────────────────────────────────────────────
+# ── Ticker name lookup (fallback if yfinance doesn't return longName) ─────────
+TICKER_NAMES = {
+    "VGT": "Vanguard Information Technology ETF",
+    "VTI": "Vanguard Total Stock Market ETF",
+    "QQQ": "Invesco QQQ Trust",
+    "SCHG": "Schwab US Large-Cap Growth ETF",
+    "SOXQ": "Invesco PHLX Semiconductor ETF",
+    "QTUM": "Defiance Quantum ETF",
+    "ITA": "iShares U.S. Aerospace & Defense ETF",
+    "ABBV": "AbbVie Inc.",
+    "LLY": "Eli Lilly and Company",
+    "MCK": "McKesson Corporation",
+    "JPM": "JPMorgan Chase & Co.",
+    "GS": "Goldman Sachs Group Inc.",
+    "WMT": "Walmart Inc.",
+    "NVDA": "NVIDIA Corporation",
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+    "AMZN": "Amazon.com Inc.",
+    "GOOGL": "Alphabet Inc.",
+    "META": "Meta Platforms Inc.",
+    "TSLA": "Tesla Inc.",
+    "NFLX": "Netflix Inc.",
+    "AMD": "Advanced Micro Devices Inc.",
+    "BTC-USD": "Bitcoin USD",
+}
 def get_start_price(prices, year):
     yr_data = prices[prices.index.year == year]
     if not yr_data.empty:
@@ -132,12 +157,12 @@ def fetch_ticker_data(ticker, max_years):
             mkt_cap = info.get("marketCap") or info.get("totalAssets")
             pe_ratio = info.get("trailingPE") or info.get("forwardPE")
             expense_ratio_decimal = get_expense_ratio(ticker_obj)
-            long_name = info.get("longName") or info.get("shortName") or ticker
+            long_name = TICKER_NAMES.get(ticker) or info.get("longName") or info.get("shortName") or ticker
         except:
             mkt_cap = None
             pe_ratio = None
             expense_ratio_decimal = None
-            long_name = ticker
+            long_name = TICKER_NAMES.get(ticker, ticker)
 
         p_info = {
             "current": float(prices.iloc[-1]),
@@ -191,7 +216,7 @@ def compute_range_cagr(prices, n_start, n_end):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📈 Settings")
-    t_input = st.text_input("Tickers", "VGT")
+    t_input = st.text_input("Tickers", "VTI, VGT, SCHG, NVDA, BTC-USD")
     investment = st.number_input("Investment ($)", value=100000)
     lookback = st.slider("Max Lookback", 3, 20, 15)
     st.markdown("**CAGR Range** (years ago)")
