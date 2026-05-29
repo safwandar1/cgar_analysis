@@ -6,6 +6,67 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 
+# ── Ticker name lookup ────────────────────────────────────────────────────────
+TICKER_NAMES = {
+    "VGT": "Vanguard Information Technology ETF",
+    "VTI": "Vanguard Total Stock Market ETF",
+    "QQQ": "Invesco QQQ Trust",
+    "SCHG": "Schwab US Large-Cap Growth ETF",
+    "SOXQ": "Invesco PHLX Semiconductor ETF",
+    "QTUM": "Defiance Quantum ETF",
+    "ITA": "iShares U.S. Aerospace & Defense ETF",
+    "ABBV": "AbbVie Inc.",
+    "LLY": "Eli Lilly and Company",
+    "MCK": "McKesson Corporation",
+    "JPM": "JPMorgan Chase & Co.",
+    "GS": "Goldman Sachs Group Inc.",
+    "WMT": "Walmart Inc.",
+    "NVDA": "NVIDIA Corporation",
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+    "AMZN": "Amazon.com Inc.",
+    "GOOGL": "Alphabet Inc.",
+    "META": "Meta Platforms Inc.",
+    "TSLA": "Tesla Inc.",
+    "NFLX": "Netflix Inc.",
+    "AMD": "Advanced Micro Devices Inc.",
+    "BTC-USD": "Bitcoin USD",
+    "V": "Visa Inc.",
+    "MA": "Mastercard Inc.",
+    "JPM": "JPMorgan Chase & Co.",
+    "BAC": "Bank of America Corp.",
+    "XOM": "Exxon Mobil Corp.",
+    "CVX": "Chevron Corp.",
+    "JNJ": "Johnson & Johnson",
+    "PG": "Procter & Gamble Co.",
+    "UNH": "UnitedHealth Group Inc.",
+    "HD": "Home Depot Inc.",
+    "COST": "Costco Wholesale Corp.",
+    "AVGO": "Broadcom Inc.",
+    "AMGN": "Amgen Inc.",
+    "PFE": "Pfizer Inc.",
+    "INTC": "Intel Corp.",
+    "CSCO": "Cisco Systems Inc.",
+    "IBM": "IBM Corp.",
+    "QCOM": "Qualcomm Inc.",
+    "TXN": "Texas Instruments Inc.",
+    "AMAT": "Applied Materials Inc.",
+    "MU": "Micron Technology Inc.",
+    "SCHW": "Charles Schwab Corp.",
+    "BRK-B": "Berkshire Hathaway Inc.",
+    "RTX": "RTX Corp.",
+    "LMT": "Lockheed Martin Corp.",
+    "NOC": "Northrop Grumman Corp.",
+    "GD": "General Dynamics Corp.",
+    "SPY": "SPDR S&P 500 ETF",
+    "VOO": "Vanguard S&P 500 ETF",
+    "SCHD": "Schwab US Dividend Equity ETF",
+    "VUG": "Vanguard Growth ETF",
+    "ARKK": "ARK Innovation ETF",
+}
+
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CAGR Analyzer",
@@ -55,32 +116,7 @@ section[data-testid="stSidebar"] [data-baseweb="input"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Ticker name lookup (fallback if yfinance doesn't return longName) ─────────
-TICKER_NAMES = {
-    "VGT": "Vanguard Information Technology ETF",
-    "VTI": "Vanguard Total Stock Market ETF",
-    "QQQ": "Invesco QQQ Trust",
-    "SCHG": "Schwab US Large-Cap Growth ETF",
-    "SOXQ": "Invesco PHLX Semiconductor ETF",
-    "QTUM": "Defiance Quantum ETF",
-    "ITA": "iShares U.S. Aerospace & Defense ETF",
-    "ABBV": "AbbVie Inc.",
-    "LLY": "Eli Lilly and Company",
-    "MCK": "McKesson Corporation",
-    "JPM": "JPMorgan Chase & Co.",
-    "GS": "Goldman Sachs Group Inc.",
-    "WMT": "Walmart Inc.",
-    "NVDA": "NVIDIA Corporation",
-    "AAPL": "Apple Inc.",
-    "MSFT": "Microsoft Corporation",
-    "AMZN": "Amazon.com Inc.",
-    "GOOGL": "Alphabet Inc.",
-    "META": "Meta Platforms Inc.",
-    "TSLA": "Tesla Inc.",
-    "NFLX": "Netflix Inc.",
-    "AMD": "Advanced Micro Devices Inc.",
-    "BTC-USD": "Bitcoin USD",
-}
+# ── Helper Functions ───────────────────────────────────────────────────────
 def get_start_price(prices, year):
     yr_data = prices[prices.index.year == year]
     if not yr_data.empty:
@@ -157,12 +193,12 @@ def fetch_ticker_data(ticker, max_years):
             mkt_cap = info.get("marketCap") or info.get("totalAssets")
             pe_ratio = info.get("trailingPE") or info.get("forwardPE")
             expense_ratio_decimal = get_expense_ratio(ticker_obj)
-            long_name = TICKER_NAMES.get(ticker) or info.get("longName") or info.get("shortName") or ticker
+            long_name = TICKER_NAMES.get(ticker) or info.get("longName") or info.get("shortName") or ""
         except:
             mkt_cap = None
             pe_ratio = None
             expense_ratio_decimal = None
-            long_name = TICKER_NAMES.get(ticker, ticker)
+            long_name = TICKER_NAMES.get(ticker, "")
 
         p_info = {
             "current": float(prices.iloc[-1]),
@@ -216,7 +252,7 @@ def compute_range_cagr(prices, n_start, n_end):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📈 Settings")
-    t_input = st.text_input("Tickers", "VTI, VGT, SCHG, NVDA, BTC-USD")
+    t_input = st.text_input("Tickers", "VGT")
     investment = st.number_input("Investment ($)", value=100000)
     lookback = st.slider("Max Lookback", 3, 20, 15)
     st.markdown("**CAGR Range** (years ago)")
@@ -261,8 +297,9 @@ with tabs[0]:
     for tkr, d in all_data.items():
         prices = d["prices"]
         pi = d["info"]
-        long_name = pi.get("long_name", tkr)
-        st.subheader(f"{tkr} — {long_name}")
+        _long = pi.get("long_name", "")
+        _title = f"{tkr} — {_long}" if _long and _long != tkr else tkr
+        st.subheader(_title)
 
         ytd = pi.get("ytd_return")
         ytd_str = f"{ytd:+.2f}%" if ytd is not None else "N/A"
