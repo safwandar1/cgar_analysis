@@ -132,10 +132,12 @@ def fetch_ticker_data(ticker, max_years):
             mkt_cap = info.get("marketCap") or info.get("totalAssets")
             pe_ratio = info.get("trailingPE") or info.get("forwardPE")
             expense_ratio_decimal = get_expense_ratio(ticker_obj)
+            long_name = info.get("longName") or info.get("shortName") or ticker
         except:
             mkt_cap = None
             pe_ratio = None
             expense_ratio_decimal = None
+            long_name = ticker
 
         p_info = {
             "current": float(prices.iloc[-1]),
@@ -145,6 +147,7 @@ def fetch_ticker_data(ticker, max_years):
             "mkt_cap": mkt_cap,
             "pe_ratio": pe_ratio,
             "expense_ratio": expense_ratio_decimal,
+            "long_name": long_name,
         }
         return prices, p_info
     except:
@@ -188,7 +191,7 @@ def compute_range_cagr(prices, n_start, n_end):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📈 Settings")
-    t_input = st.text_input("Tickers", "VTI, VGT, SCHG, NVDA, BTC-USD")
+    t_input = st.text_input("Tickers", "VGT")
     investment = st.number_input("Investment ($)", value=100000)
     lookback = st.slider("Max Lookback", 3, 20, 15)
     st.markdown("**CAGR Range** (years ago)")
@@ -233,7 +236,8 @@ with tabs[0]:
     for tkr, d in all_data.items():
         prices = d["prices"]
         pi = d["info"]
-        st.subheader(f"Analysis for {tkr}")
+        long_name = pi.get("long_name", tkr)
+        st.subheader(f"{tkr} — {long_name}")
 
         ytd = pi.get("ytd_return")
         ytd_str = f"{ytd:+.2f}%" if ytd is not None else "N/A"
