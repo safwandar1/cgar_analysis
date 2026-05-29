@@ -23,6 +23,24 @@ h1, h2, h3 { font-family: 'DM Serif Display', serif !important; }
 .stApp { background-color: #f7fbf8; }
 section[data-testid="stSidebar"] { background: linear-gradient(160deg, #0d3321 0%, #1a5c3a 100%); }
 section[data-testid="stSidebar"] * { color: #d4f0e0 !important; }
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea,
+section[data-testid="stSidebar"] [data-baseweb="input"] input,
+section[data-testid="stSidebar"] [data-baseweb="textarea"] textarea {
+    color: #0d3321 !important;
+    background-color: #d4f0e0 !important;
+    border: 1.5px solid #a8d5bc !important;
+    border-radius: 8px !important;
+}
+section[data-testid="stSidebar"] [data-baseweb="select"] div,
+section[data-testid="stSidebar"] [data-baseweb="select"] span {
+    color: #0d3321 !important;
+    background-color: #d4f0e0 !important;
+}
+section[data-testid="stSidebar"] [data-baseweb="input"] {
+    background-color: #d4f0e0 !important;
+    border-radius: 8px !important;
+}
 [data-testid="stMetric"] {
     background: #ffffff;
     border: 1.5px solid #c3e8d0;
