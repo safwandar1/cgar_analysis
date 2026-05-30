@@ -75,6 +75,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+if "cache_cleared" not in st.session_state:
+    st.cache_data.clear()
+    st.session_state["cache_cleared"] = True
+
 # ── Theme ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -181,11 +185,32 @@ def fetch_ticker_data(ticker, max_years):
         prices = prices.dropna()
         year_ago = prices.iloc[-252:] if len(prices) > 252 else prices
 
-        ytd_data = prices[prices.index.year == today.year]
-        if len(ytd_data) > 1:
-            ytd_return = (float(ytd_data.iloc[-1]) / float(ytd_data.iloc[0]) - 1) * 100
-        else:
-            ytd_return = None
+        # Fetch YTD directly from Yahoo Finance summary API — more reliable than price math
+        try:
+            import requests
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=ytd&interval=1d"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=5)
+            chart = resp.json()["chart"]["result"][0]
+            meta = chart["meta"]
+            ytd_prices = chart["indicators"]["quote"][0]["close"]
+            ytd_prices = [p for p in ytd_prices if p is not None]
+            prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if ytd_prices and prev_close:
+                # prev_close from YTD range = Dec 31 prior year close
+                ytd_return = (ytd_prices[-1] / prev_close - 1) * 100
+            else:
+                ytd_return = None
+        except Exception:
+            # Fallback to price series math if API fails
+            ytd_data = prices[prices.index.year == today.year]
+            prior_year_data = prices[prices.index.year == today.year - 1]
+            if not prior_year_data.empty and not ytd_data.empty:
+                ytd_return = (float(ytd_data.iloc[-1]) / float(prior_year_data.iloc[-1]) - 1) * 100
+            elif len(ytd_data) > 1:
+                ytd_return = (float(ytd_data.iloc[-1]) / float(ytd_data.iloc[0]) - 1) * 100
+            else:
+                ytd_return = None
 
         try:
             ticker_obj = yf.Ticker(ticker)
@@ -231,8 +256,6 @@ def compute_cagr_df(prices, max_years):
 
 def compute_range_cagr(prices, n_start, n_end):
     today = datetime.today()
-    year_from = today.year - n_end
-    val_from, dt_from = get_start_price(prices, year_from)
 
     if n_start == 0:
         val_to = float(prices.iloc[-1])
@@ -241,12 +264,20 @@ def compute_range_cagr(prices, n_start, n_end):
         year_to = today.year - n_start
         val_to, dt_to = get_start_price(prices, year_to)
 
+    if n_end == 0:
+        val_from = float(prices.iloc[-1])
+        dt_from  = prices.index[-1]
+    else:
+        year_from = today.year - n_end
+        val_from, dt_from = get_start_price(prices, year_from)
+
     if val_from and val_to and dt_from is not None and dt_to is not None:
         days = (dt_to - dt_from).days
-        if days > 0:
-            years_elapsed = days / 365.25
-            cagr = (val_to / val_from)**(1/years_elapsed) - 1
-            return round(cagr * 100, 2), val_from, val_to, dt_from, dt_to
+        if days <= 0:
+            return None, val_from, val_to, dt_from, dt_to
+        years_elapsed = days / 365.25
+        cagr = (val_to / val_from)**(1/years_elapsed) - 1
+        return round(cagr * 100, 2), val_from, val_to, dt_from, dt_to
     return None, None, None, None, None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -338,6 +369,8 @@ with tabs[0]:
                     <div style="margin-top:8px; font-size:0.8rem; color:#888;">{span_years}-year window</div>
                 </div>
                 """, unsafe_allow_html=True)
+            elif r_from is not None:
+                st.info(f"⚠️ Same period on both ends ({range_label}). Drag the slider to create a range of at least 1 year.")
             else:
                 st.warning(f"Not enough data for {range_label} range.")
 
