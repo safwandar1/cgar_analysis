@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 # ── Ticker name lookup ────────────────────────────────────────────────────────
 TICKER_NAMES = {
@@ -75,6 +76,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Auto-refresh ──────────────────────────────────────────────────────────────
+# Streamlit does NOT re-run the script on its own — only on widget interaction
+# or a fresh page load. Without this, a tab left open just keeps showing
+# whatever was rendered the last time it actually executed, no matter how
+# stale the underlying cached data becomes. This forces a rerun every 60s,
+# which (combined with the ttl=3600 cache below) keeps prices reasonably
+# current without the user needing to manually reload the page.
+st_autorefresh(interval=60_000, key="data_refresh")
+
 if "cache_cleared" not in st.session_state:
     st.cache_data.clear()
     st.session_state["cache_cleared"] = True
@@ -135,15 +145,15 @@ def calculate_after_expense(initial_investment, years, cagr_percent, expense_rat
     if expense_ratio_decimal is None or expense_ratio_decimal <= 0:
         final_value = initial_investment * ((1 + cagr_percent/100) ** years)
         return final_value, 0
-    
+
     value = initial_investment
-    
+
     for year in range(years):
         # Grow the investment for the year
         value = value * (1 + cagr_percent/100)
         # Deduct the fee (opportunity cost - this fee doesn't grow in future years)
         value = value * (1 - expense_ratio_decimal)
-    
+
     # Calculate total fees paid (opportunity cost)
     gross_value = initial_investment * ((1 + cagr_percent/100) ** years)
     total_fees = gross_value - value
@@ -153,11 +163,11 @@ def get_expense_ratio(ticker_obj):
     """Get expense ratio - yfinance returns values like 0.09 for VGT (meaning 0.09%)"""
     try:
         info = ticker_obj.info
-        
+
         # Try different field names that might contain the expense ratio
-        expense_fields = ['annualReportExpenseRatio', 'expenseRatio', 'totalAnnualOperatingExpenses', 
+        expense_fields = ['annualReportExpenseRatio', 'expenseRatio', 'totalAnnualOperatingExpenses',
                          'managementExpenseRatio', 'grossExpenseRatio', 'netExpenseRatio']
-        
+
         for field in expense_fields:
             value = info.get(field)
             if value is not None and isinstance(value, (int, float)):
@@ -168,18 +178,24 @@ def get_expense_ratio(ticker_obj):
                 # 0.09% = 0.0009 as decimal
                 decimal_value = value / 100
                 return decimal_value
-                        
+
         return None
     except:
         return None
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ticker_data(ticker, max_years):
+    """
+    Returns (prices, info) on success.
+    Returns (None, error_message) on failure so the caller can show
+    *why* a ticker failed instead of silently dropping it.
+    """
     today = datetime.today()
     start_date = f"{today.year - max_years - 1}-01-01"
     try:
         data = yf.download(ticker, start=start_date, end=today.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        if data.empty: return None, None
+        if data.empty:
+            return None, f"No data returned for '{ticker}' — check the ticker symbol."
         data.index = data.index.tz_localize(None)
         prices = data["Close"][ticker] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
         prices = prices.dropna()
@@ -234,10 +250,11 @@ def fetch_ticker_data(ticker, max_years):
             "pe_ratio": pe_ratio,
             "expense_ratio": expense_ratio_decimal,
             "long_name": long_name,
+            "fetched_at": today.strftime("%Y-%m-%d %H:%M:%S"),
         }
         return prices, p_info
-    except:
-        return None, None
+    except Exception as e:
+        return None, f"Error fetching '{ticker}': {e}"
 
 def compute_cagr_df(prices, max_years):
     today = datetime.today()
@@ -294,15 +311,24 @@ with st.sidebar:
         value=(min(5, lookback), min(10, lookback)),
     )
     horizon_start, horizon_end = min(horizon_range), max(horizon_range)
+    st.divider()
+    st.caption(f"🔄 Auto-refreshing every 60s · Last script run: {datetime.now().strftime('%H:%M:%S')}")
 
 # ── Main Logic ────────────────────────────────────────────────────────────────
 tickers = [t.strip().upper() for t in t_input.split(",") if t.strip()]
 all_data = {}
+fetch_errors = {}
 
 for t in tickers:
     p, info = fetch_ticker_data(t, lookback)
     if p is not None:
         all_data[t] = {"prices": p, "info": info, "cagr_df": compute_cagr_df(p, lookback)}
+    else:
+        fetch_errors[t] = info  # info holds the error message string in this branch
+
+if fetch_errors:
+    for t, msg in fetch_errors.items():
+        st.error(f"⚠️ **{t}**: {msg}")
 
 if not all_data:
     st.warning("No data found. Check ticker symbols.")
@@ -331,6 +357,7 @@ with tabs[0]:
         _long = pi.get("long_name", "")
         _title = f"{tkr} — {_long}" if _long and _long != tkr else tkr
         st.subheader(_title)
+        st.caption(f"Data as of {pi.get('fetched_at', 'unknown')}")
 
         ytd = pi.get("ytd_return")
         ytd_str = f"{ytd:+.2f}%" if ytd is not None else "N/A"
@@ -338,7 +365,7 @@ with tabs[0]:
 
         pe = pi.get("pe_ratio")
         pe_str = f"{pe:.1f}x" if pe is not None else "N/A"
-        
+
         expense_decimal = pi.get("expense_ratio")
         expense_str = f"{expense_decimal*100:.3f}%" if expense_decimal is not None else "N/A"
 
@@ -379,11 +406,11 @@ with tabs[0]:
                 future_val = investment * ((1 + r_cagr / 100) ** span_years)
                 future_year = today_year + span_years
                 color2 = "#0d5c32" if r_cagr >= 0 else "#b91c1c"
-                
+
                 # Calculate after expense with proper opportunity cost
                 after_expense_val, drag_amount = calculate_after_expense(investment, span_years, r_cagr, expense_decimal)
                 expense_display = f"{expense_decimal*100:.3f}%" if expense_decimal else None
-                
+
                 st.markdown(f"""
                 <div style="background:white; border:1.5px solid #bde0cc; border-radius:18px; padding:25px; margin:10px 0;">
                     <div style="font-size:0.7rem; text-transform:uppercase; color:#4a7c5f;">🚀 If Same CAGR Repeats · {today_year} → {future_year}</div>
@@ -396,7 +423,7 @@ with tabs[0]:
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                
+
                 # Expense info using st.info (clean and simple)
                 if expense_decimal is not None and expense_decimal > 0:
                     st.info(f"📉 **After {expense_display} expense ratio:** ${after_expense_val:,.0f}  \n\n*Lost ${drag_amount:,.0f} to fees (opportunity cost) over {span_years} years*")
@@ -413,9 +440,9 @@ with tabs[1]:
             if len(yr_data) > 1:
                 ret = (yr_data.iloc[-1] / yr_data.iloc[0] - 1) * 100
                 ann_rets.append({"Year": str(y), "Return": ret})
-        
+
         if ann_rets:
-            fig = px.bar(pd.DataFrame(ann_rets), x="Year", y="Return", title=f"{tkr} Annual Returns", 
+            fig = px.bar(pd.DataFrame(ann_rets), x="Year", y="Return", title=f"{tkr} Annual Returns",
                         color="Return", color_continuous_scale="RdYlGn")
             st.plotly_chart(fig, use_container_width=True)
 
@@ -435,7 +462,7 @@ with tabs[3]:
     range_label = f"{today_year - horizon_end} → {today_year - horizon_start}"
     future_year = today_year + span_years
     st.info(f"📅 Historical: {range_label} &nbsp;|&nbsp; 🚀 Forward projection: {today_year} → {future_year}")
-    
+
     for tkr, d in all_data.items():
         prices = d["prices"]
         pi = d["info"]
@@ -445,13 +472,13 @@ with tabs[3]:
         if r_cagr is not None:
             proj_historical = investment * ((1 + r_cagr/100)**span_years)
             proj_forward = investment * ((1 + r_cagr/100)**span_years)
-            
+
             # Calculate after expense with proper opportunity cost
             after_expense_hist, drag_hist = calculate_after_expense(investment, span_years, r_cagr, expense_decimal)
             after_expense_fwd, drag_fwd = calculate_after_expense(investment, span_years, r_cagr, expense_decimal)
-            
+
             expense_display = f"{expense_decimal*100:.3f}%" if expense_decimal else None
-            
+
             with st.container():
                 col1, col2 = st.columns(2)
                 with col1:
@@ -463,7 +490,7 @@ with tabs[3]:
                     if expense_decimal:
                         st.caption(f"💰 After {expense_display} fees: ${after_expense_hist:,.0f}")
                         st.caption(f"📉 Lost ${drag_hist:,.0f} to fees")
-                
+
                 with col2:
                     st.metric(
                         label=f"🚀 {tkr} Forward ({today_year}→{future_year})",
