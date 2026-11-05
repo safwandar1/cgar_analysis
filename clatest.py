@@ -2,10 +2,33 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
+
+# ── Twelve Data API key ───────────────────────────────────────────────────────
+# Get a free key at https://twelvedata.com/ (Basic/free plan: 800 credits/day,
+# 8 credits/minute). Add it to Streamlit Cloud under App settings -> Secrets as:
+#   TWELVE_DATA_API_KEY = "your_key_here"
+# Locally, put the same line in a .streamlit/secrets.toml file (don't commit that file).
+try:
+    TWELVE_DATA_API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
+except Exception:
+    # st.secrets access can raise if no secrets.toml exists at all yet (e.g. first local run)
+    TWELVE_DATA_API_KEY = ""
+TWELVE_DATA_BASE = "https://api.twelvedata.com"
+
+# Expense ratios for known funds — Twelve Data's free tier doesn't expose fund
+# fundamentals, and these numbers barely change, so a static lookup is more
+# reliable here than an extra paid API call. Individual stocks correctly have
+# no entry (they don't have expense ratios) and will just show "N/A".
+EXPENSE_RATIOS = {
+    "VGT": 0.09, "VTI": 0.03, "QQQ": 0.20, "SCHG": 0.04, "SOXQ": 0.19,
+    "QTUM": 0.40, "ITA": 0.40, "SPY": 0.0945, "VOO": 0.03, "SCHD": 0.06,
+    "VUG": 0.04, "ARKK": 0.75, "SOXL": 0.75, "SOXS": 0.94,
+}
 
 # ── Ticker name lookup ────────────────────────────────────────────────────────
 TICKER_NAMES = {
@@ -183,72 +206,83 @@ def get_expense_ratio(ticker_obj):
     except:
         return None
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=900)
 def fetch_ticker_data(ticker, max_years):
     """
     Returns (prices, info) on success.
     Returns (None, error_message) on failure so the caller can show
     *why* a ticker failed instead of silently dropping it.
+
+    Uses Twelve Data (API-key based, per-key rate limits) instead of yfinance/
+    Yahoo scraping — Yahoo has been observed to serve stale cached responses
+    to Streamlit Community Cloud's shared IP pool, which yfinance can't detect
+    or recover from since Yahoo returns a "successful" response either way.
     """
+    if not TWELVE_DATA_API_KEY:
+        return None, "No TWELVE_DATA_API_KEY found in st.secrets. Add your free API key under App settings -> Secrets."
+
     today = datetime.today()
     start_date = f"{today.year - max_years - 1}-01-01"
+
     try:
-        # yfinance treats `end` as exclusive: end=today would drop today's bar, so ask for tomorrow
-        data = yf.download(ticker, start=start_date, end=(today + timedelta(days=1)).strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        if data.empty:
-            return None, f"No data returned for '{ticker}' — check the ticker symbol."
-        data.index = data.index.tz_localize(None)
-        prices = data["Close"][ticker] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
+        # ── Historical daily series (for CAGR calculations) ──────────────────
+        ts_url = (
+            f"{TWELVE_DATA_BASE}/time_series"
+            f"?symbol={ticker}&interval=1day&start_date={start_date}"
+            f"&end_date={today.strftime('%Y-%m-%d')}&order=ASC&apikey={TWELVE_DATA_API_KEY}"
+        )
+        ts_resp = requests.get(ts_url, timeout=15).json()
+
+        if ts_resp.get("status") == "error" or "values" not in ts_resp:
+            msg = ts_resp.get("message", "unknown error")
+            return None, f"Twelve Data error for '{ticker}': {msg}"
+
+        df = pd.DataFrame(ts_resp["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+        prices = df["close"].astype(float)
         prices = prices.dropna()
+
+        if prices.empty:
+            return None, f"No historical data returned for '{ticker}'."
+
         year_ago = prices.iloc[-252:] if len(prices) > 252 else prices
 
-        # Fetch YTD directly from Yahoo Finance summary API — more reliable than price math
+        # ── Live quote (current price, 52w hi/lo, YTD via previous_close) ────
+        ytd_return = None
+        hi52, lo52 = float(year_ago.max()), float(year_ago.min())
+        current_price = float(prices.iloc[-1])
         try:
-            import requests
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=ytd&interval=1d"
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(url, headers=headers, timeout=5)
-            chart = resp.json()["chart"]["result"][0]
-            meta = chart["meta"]
-            ytd_prices = chart["indicators"]["quote"][0]["close"]
-            ytd_prices = [p for p in ytd_prices if p is not None]
-            prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-            if ytd_prices and prev_close:
-                # prev_close from YTD range = Dec 31 prior year close
-                ytd_return = (ytd_prices[-1] / prev_close - 1) * 100
-            else:
-                ytd_return = None
+            q_url = f"{TWELVE_DATA_BASE}/quote?symbol={ticker}&apikey={TWELVE_DATA_API_KEY}"
+            q_resp = requests.get(q_url, timeout=10).json()
+            if q_resp.get("close"):
+                current_price = float(q_resp["close"])
+            if q_resp.get("fifty_two_week"):
+                hi52 = float(q_resp["fifty_two_week"].get("high", hi52))
+                lo52 = float(q_resp["fifty_two_week"].get("low", lo52))
         except Exception:
-            # Fallback to price series math if API fails
-            ytd_data = prices[prices.index.year == today.year]
-            prior_year_data = prices[prices.index.year == today.year - 1]
-            if not prior_year_data.empty and not ytd_data.empty:
-                ytd_return = (float(ytd_data.iloc[-1]) / float(prior_year_data.iloc[-1]) - 1) * 100
-            elif len(ytd_data) > 1:
-                ytd_return = (float(ytd_data.iloc[-1]) / float(ytd_data.iloc[0]) - 1) * 100
-            else:
-                ytd_return = None
+            pass  # fall back to values derived from the time_series above
 
-        try:
-            ticker_obj = yf.Ticker(ticker)
-            info = ticker_obj.info
-            mkt_cap = info.get("marketCap") or info.get("totalAssets")
-            pe_ratio = info.get("trailingPE") or info.get("forwardPE")
-            expense_ratio_decimal = get_expense_ratio(ticker_obj)
-            long_name = TICKER_NAMES.get(ticker) or info.get("longName") or info.get("shortName") or ""
-        except:
-            mkt_cap = None
-            pe_ratio = None
-            expense_ratio_decimal = None
-            long_name = TICKER_NAMES.get(ticker, "")
+        # YTD: compare current price to prior-year-end close from the price series
+        prior_year_data = prices[prices.index.year == today.year - 1]
+        ytd_data = prices[prices.index.year == today.year]
+        if not prior_year_data.empty:
+            ytd_return = (current_price / float(prior_year_data.iloc[-1]) - 1) * 100
+        elif len(ytd_data) > 1:
+            ytd_return = (current_price / float(ytd_data.iloc[0]) - 1) * 100
+
+        long_name = TICKER_NAMES.get(ticker, "")
+        expense_ratio_decimal = EXPENSE_RATIOS.get(ticker)
+        if expense_ratio_decimal is not None:
+            expense_ratio_decimal = expense_ratio_decimal / 100
 
         p_info = {
-            "current": float(prices.iloc[-1]),
-            "hi52": float(year_ago.max()),
-            "lo52": float(year_ago.min()),
+            "current": current_price,
+            "hi52": hi52,
+            "lo52": lo52,
             "ytd_return": ytd_return,
-            "mkt_cap": mkt_cap,
-            "pe_ratio": pe_ratio,
+            "mkt_cap": None,  # not available on Twelve Data's free tier
+            "pe_ratio": None,  # not available on Twelve Data's free tier
             "expense_ratio": expense_ratio_decimal,
             "long_name": long_name,
             "fetched_at": today.strftime("%Y-%m-%d %H:%M:%S"),
@@ -298,246 +332,6 @@ def compute_range_cagr(prices, n_start, n_end):
         return round(cagr * 100, 2), val_from, val_to, dt_from, dt_to
     return None, None, None, None, None
 
-# ── Support / Resistance helpers ─────────────────────────────────────────────
-import math
-
-FIELDS = ["Open", "High", "Low", "Close", "Volume"]
-
-
-# --------------------------------------------------------------------------- data prep
-def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a clean Open/High/Low/Close/Volume frame.
-
-    Handles yfinance quirks: MultiIndex columns for a single ticker, lowercase names,
-    duplicate columns, and unsorted index.
-    """
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        level0 = set(out.columns.get_level_values(0))
-        level = 0 if {"Open", "High", "Low", "Close"}.issubset(level0) else 1
-        out.columns = out.columns.get_level_values(level)
-    out.columns = [str(c).strip().title() for c in out.columns]
-    out = out.loc[:, ~pd.Index(out.columns).duplicated()]
-    if "Close" not in out.columns and "Adj Close" in out.columns:
-        out["Close"] = out["Adj Close"]
-    missing = [c for c in FIELDS if c not in out.columns]
-    if missing:
-        raise ValueError(f"Price data is missing columns: {missing}")
-    out = out[FIELDS].apply(pd.to_numeric, errors="coerce")
-    out = out.dropna(subset=["High", "Low", "Close"])
-    out["Volume"] = out["Volume"].fillna(0)
-    return out.sort_index()
-
-
-# --------------------------------------------------------------------------- building blocks
-def swing_points(df: pd.DataFrame, kind: str = "support", window: int = 5) -> pd.DataFrame:
-    """Swing lows (support) or swing highs (resistance).
-
-    A bar qualifies if its Low (or High) is the extreme of the `window` bars on each side.
-    The last `window` bars can't be confirmed yet, so they are skipped.
-    """
-    col = "Low" if kind == "support" else "High"
-    s = df[col]
-    roll = s.rolling(2 * window + 1, center=True)
-    extreme = roll.min() if kind == "support" else roll.max()
-    mask = (s == extreme) & extreme.notna()
-    pts = df.loc[mask, [col, "Volume"]].rename(columns={col: "price"})
-    # equal extremes on back-to-back bars count once
-    keep = ~(pts["price"].eq(pts["price"].shift()) & mask[mask].index.isin(pts.index))
-    first = np.r_[True, np.diff(np.flatnonzero(mask.to_numpy())) > 1]
-    return pts[keep.to_numpy() | first]
-
-
-def volume_profile(df: pd.DataFrame, bins: int = 60) -> pd.DataFrame:
-    """Volume traded at each price level; each bar's volume is spread across its High-Low range."""
-    lo, hi = float(df["Low"].min()), float(df["High"].max())
-    if hi <= lo:
-        return pd.DataFrame({"price": [lo], "volume": [float(df["Volume"].sum())]})
-    edges = np.linspace(lo, hi, bins + 1)
-    vol = np.zeros(bins)
-    for bar_lo, bar_hi, v in zip(df["Low"].to_numpy(), df["High"].to_numpy(), df["Volume"].to_numpy()):
-        if v <= 0:
-            continue
-        i0 = max(np.searchsorted(edges, bar_lo, side="right") - 1, 0)
-        i1 = min(np.searchsorted(edges, bar_hi, side="left"), bins)
-        i1 = max(i1, i0 + 1)
-        vol[i0:i1] += v / (i1 - i0)
-    centers = (edges[:-1] + edges[1:]) / 2
-    return pd.DataFrame({"price": centers, "volume": vol})
-
-
-def high_volume_nodes(profile: pd.DataFrame, top_pct: float = 0.30) -> pd.DataFrame:
-    """Local peaks in the volume profile that sit in the top `top_pct` of all bins."""
-    v = profile["volume"].to_numpy()
-    if len(v) < 3:
-        return profile.iloc[0:0]
-    threshold = np.quantile(v, 1 - top_pct)
-    is_peak = np.r_[False, (v[1:-1] >= v[:-2]) & (v[1:-1] >= v[2:]), False]
-    return profile[is_peak & (v >= threshold)]
-
-
-def round_step(price: float) -> float:
-    """Psychological round-number spacing, e.g. 280 -> 50 (250, 300), 42 -> 5 (40, 45)."""
-    return 10 ** math.floor(math.log10(price)) / 2 if price > 0 else 1.0
-
-
-def _cluster(points: pd.DataFrame, tol_pct: float) -> list[dict]:
-    """Merge swing points within tol_pct of the lowest price in the group."""
-    clusters: list[dict] = []
-    for date, row in points.sort_values("price").iterrows():
-        p = float(row["price"])
-        if clusters and (p - clusters[-1]["anchor"]) / clusters[-1]["anchor"] <= tol_pct:
-            c = clusters[-1]
-            c["prices"].append(p)
-            c["dates"].append(date)
-        else:
-            clusters.append({"anchor": p, "prices": [p], "dates": [date]})
-    return clusters
-
-
-# --------------------------------------------------------------------------- main function
-def find_levels(
-    df: pd.DataFrame,
-    kind: str = "support",
-    window: int = 5,
-    tol_pct: float = 0.015,
-    lookback: int | None = 504,
-    max_levels: int = 6,
-    min_score: float = 2.0,
-) -> pd.DataFrame:
-    """Support (below price) or resistance (above price) zones, nearest first.
-
-    df         daily OHLCV (run normalize_ohlcv first if it came from yfinance)
-    kind       "support" or "resistance"
-    window     bars on each side needed to confirm a swing point (5 = about a week)
-    tol_pct    how close swing points must be to count as the same zone (0.015 = 1.5%)
-    lookback   bars of history to use (504 = about 2 years); None = everything
-    max_levels how many zones to return
-    min_score  drop zones weaker than this
-    """
-    if kind not in ("support", "resistance"):
-        raise ValueError("kind must be 'support' or 'resistance'")
-    data = df if lookback is None else df.iloc[-lookback:]
-    if len(data) < 2 * window + 5:
-        raise ValueError("Not enough price history for this window")
-
-    price = float(data["Close"].iloc[-1])
-    recent_cutoff = data.index[int(len(data) * 0.75)]
-    ma = {
-        "50-day MA": float(data["Close"].rolling(50).mean().iloc[-1]) if len(data) >= 50 else np.nan,
-        "200-day MA": float(data["Close"].rolling(200).mean().iloc[-1]) if len(data) >= 200 else np.nan,
-    }
-    step = round_step(price)
-    profile = volume_profile(data)
-    max_vol = float(profile["volume"].max()) or 1.0
-    nodes = high_volume_nodes(profile)
-
-    def volume_score(lo: float, hi: float) -> float:
-        pad = price * tol_pct / 2
-        in_zone = profile[(profile["price"] >= lo - pad) & (profile["price"] <= hi + pad)]
-        return float(in_zone["volume"].max()) / max_vol if len(in_zone) else 0.0
-
-    def on_correct_side(level: float) -> bool:
-        return level < price if kind == "support" else level > price
-
-    rows = []
-    # 1) clustered swing points
-    for c in _cluster(swing_points(data, kind, window), tol_pct):
-        level = float(np.median(c["prices"]))
-        if not on_correct_side(level):
-            continue
-        lo, hi = min(c["prices"]), max(c["prices"])
-        rows.append({
-            "level": level, "zone_low": lo, "zone_high": hi,
-            "touches": len(c["prices"]), "last_touch": max(c["dates"]),
-            "sources": [f"swing {'lows' if kind == 'support' else 'highs'}"],
-        })
-
-    # 2) high-volume price levels not already covered by a swing zone
-    for _, node in nodes.iterrows():
-        level = float(node["price"])
-        if not on_correct_side(level):
-            continue
-        if any(abs(level - r["level"]) / level <= tol_pct for r in rows):
-            continue
-        rows.append({"level": level, "zone_low": level, "zone_high": level,
-                     "touches": 0, "last_touch": pd.NaT, "sources": ["high-volume node"]})
-
-    # 3) moving averages as their own levels if nothing else is there
-    for name, value in ma.items():
-        if np.isnan(value) or not on_correct_side(value):
-            continue
-        if any(abs(value - r["level"]) / value <= tol_pct for r in rows):
-            continue
-        rows.append({"level": value, "zone_low": value, "zone_high": value,
-                     "touches": 0, "last_touch": pd.NaT, "sources": [name]})
-
-    if not rows:
-        return pd.DataFrame(columns=["level", "zone_low", "zone_high", "distance_pct", "touches",
-                                     "last_touch", "score", "strength", "sources"])
-
-    # scoring
-    min_half_width = price * tol_pct / 4
-    for r in rows:
-        if r["zone_high"] - r["zone_low"] < 2 * min_half_width:
-            r["zone_low"], r["zone_high"] = r["level"] - min_half_width, r["level"] + min_half_width
-        vs = volume_score(r["zone_low"], r["zone_high"])
-        score = 1.0 * r["touches"] + 2.0 * vs
-        for name, value in ma.items():
-            if not np.isnan(value) and r["zone_low"] - price * tol_pct <= value <= r["zone_high"] + price * tol_pct:
-                score += 1.0
-                if name not in r["sources"]:
-                    r["sources"].append(name)
-        nearest_round = round(r["level"] / step) * step
-        if abs(r["level"] - nearest_round) / r["level"] <= tol_pct:
-            score += 0.5
-            r["sources"].append(f"round number {nearest_round:g}")
-        if pd.notna(r["last_touch"]) and r["last_touch"] >= recent_cutoff:
-            score += 0.5
-        if vs >= 0.6 and "high-volume node" not in r["sources"]:
-            r["sources"].append("heavy volume")
-        if r["sources"] == ["50-day MA"] or r["sources"] == ["200-day MA"]:
-            score = max(score, 2.0)  # widely watched even with nothing else there
-        r["score"] = round(score, 2)
-
-    out = pd.DataFrame(rows)
-    out["distance_pct"] = (out["level"] / price - 1) * 100
-    out["strength"] = pd.cut(out["score"], bins=[-np.inf, 2.5, 4.0, np.inf],
-                             labels=["weak", "moderate", "strong"]).astype(str)
-    out["sources"] = out["sources"].apply(lambda s: ", ".join(dict.fromkeys(s)))
-    out = out[out["score"] >= min_score]
-    out = out.sort_values("level", ascending=(kind == "resistance")).head(max_levels)
-    cols = ["level", "zone_low", "zone_high", "distance_pct", "touches",
-            "last_touch", "score", "strength", "sources"]
-    return out[cols].round({"level": 2, "zone_low": 2, "zone_high": 2, "distance_pct": 1}).reset_index(drop=True)
-
-
-# --------------------------------------------------------------------------- chart
-def plot_levels(df: pd.DataFrame, supports: pd.DataFrame | None = None,
-                resistances: pd.DataFrame | None = None, title: str = "",
-                show_last: int = 260):
-    """Candlestick chart with shaded support (green) and resistance (red) zones."""
-    import plotly.graph_objects as go
-
-    data = df.iloc[-show_last:]
-    fig = go.Figure(go.Candlestick(
-        x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"],
-        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"))
-    for frame, color, tag in ((supports, "34,139,34", "S"), (resistances, "220,20,60", "R")):
-        if frame is None or frame.empty:
-            continue
-        for _, r in frame.iterrows():
-            alpha = {"strong": 0.30, "moderate": 0.20}.get(r["strength"], 0.10)
-            fig.add_hrect(y0=r["zone_low"], y1=r["zone_high"], line_width=0,
-                          fillcolor=f"rgba({color},{alpha})")
-            fig.add_hline(y=r["level"], line_dash="dot", line_color=f"rgb({color})", line_width=1,
-                          annotation_text=f"{tag} {r['level']:.2f} ({r['strength']})",
-                          annotation_position="right", annotation_font_size=11)
-    fig.update_layout(title=title, height=620, xaxis_rangeslider_visible=False,
-                      margin=dict(l=10, r=140, t=40, b=10), showlegend=False)
-    return fig
-
-
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📈 Settings")
@@ -579,7 +373,7 @@ st.title("Portfolio CAGR Analyzer")
 st.markdown("".join([f'<span class="ticker-tag">{t}</span>' for t in all_data]), unsafe_allow_html=True)
 
 # ── Create Tabs AFTER all data is loaded ──────────────────────────────────────
-tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance"])
+tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener"])
 
 def fmt_mkt_cap(val):
     if val is None: return "N/A"
@@ -614,7 +408,18 @@ with tabs[0]:
         col1.metric("Current Price", f"${pi['current']:,.2f}")
         col2.metric("52W High", f"${pi['hi52']:,.2f}")
         col3.metric("52W Low", f"${pi['lo52']:,.2f}")
-        col4.metric("Mkt Cap / AUM", fmt_mkt_cap(pi.get("mkt_cap")))
+        mkt_cap = pi.get("mkt_cap")
+        if mkt_cap:
+            col4.metric("Mkt Cap / AUM", fmt_mkt_cap(mkt_cap))
+        else:
+            # Fallback when market cap isn't available: % below the 52-week high
+            hi52, cur = pi.get("hi52"), pi.get("current")
+            if hi52 and cur is not None:
+                pct_from_high = (cur - hi52) / hi52 * 100
+                col4.metric("From 52W High", f"{pct_from_high:+.2f}%",
+                            delta=f"{pct_from_high:+.2f}%")
+            else:
+                col4.metric("From 52W High", "N/A")
         col5.metric("YTD Return", ytd_str, delta=ytd_delta)
         col6.metric("Expense Ratio", expense_str)
 
@@ -907,6 +712,8 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("S&P 500 Sharpe Ratio Screener")
     st.caption("Fetches live data for a large batch of S&P 500 stocks and ranks by Sharpe ratio. Takes ~2–4 min on first run — results are cached for 1 hour.")
+    st.caption("ℹ️ This tab still uses yfinance (Twelve Data's free 800-credit/day limit isn't enough for ~140 tickers per run). "
+               "It can occasionally hit the same Yahoo rate-limit/stale-data issue as before — if results look off, wait a bit and re-run.")
 
     # ── Universe ──────────────────────────────────────────────────────────────
     SP500_TICKERS = [
@@ -948,7 +755,7 @@ with tabs[6]:
         try:
             raw = yf.download(
                 tickers, start=start,
-                end=(today + timedelta(days=1)).strftime("%Y-%m-%d"),
+                end=today.strftime("%Y-%m-%d"),
                 progress=False, auto_adjust=True
             )
             if isinstance(raw.columns, pd.MultiIndex):
@@ -1094,62 +901,3 @@ with tabs[6]:
             )
     else:
         st.info("👆 Click **Run Screener** to fetch live data and rank all tickers by Sharpe ratio.")
-
-
-# ── Tab 7: Support / Resistance ────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_ohlcv(ticker):
-    raw = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False)
-    return normalize_ohlcv(raw) if raw is not None and not raw.empty else None
-
-with tabs[7]:
-    st.caption("Zones come from swing points, volume profile, 50/200-day averages and round numbers. "
-               "They show where buyers or sellers stepped in before, not a guarantee.")
-    c1, c2 = st.columns(2)
-    sr_window = c1.slider("Swing confirmation (bars each side)", 3, 15, 5, key="sr_window")
-    sr_tol = c2.slider("Zone width (%)", 0.5, 4.0, 1.5, 0.25, key="sr_tol") / 100
-
-    for tkr in all_data:
-        st.subheader(tkr)
-        try:
-            df_sr = fetch_ohlcv(tkr)
-        except Exception as e:
-            st.warning(f"Could not download {tkr}: {e}")
-            continue
-        if df_sr is None or len(df_sr) < 60:
-            st.warning(f"Not enough price history for {tkr}.")
-            continue
-        try:
-            sup = find_levels(df_sr, "support", window=sr_window, tol_pct=sr_tol)
-            res = find_levels(df_sr, "resistance", window=sr_window, tol_pct=sr_tol)
-        except ValueError as e:
-            st.warning(f"{tkr}: {e}")
-            continue
-        last_px = float(df_sr["Close"].iloc[-1])
-        st.metric("Last close", f"${last_px:,.2f}")
-
-        # Price below every swing low of the last 2 years -> look back over the full history
-        if sup.empty:
-            sup = find_levels(df_sr, "support", window=sr_window, tol_pct=sr_tol, lookback=None)
-            yrs = len(df_sr) / 252
-            two_yr_low = float(df_sr["Low"].iloc[-504:].min())
-            if not sup.empty:
-                st.info(f"📉 {tkr} is trading below every swing low of the past 2 years "
-                        f"(2-year low ${two_yr_low:,.2f}). Showing older support from the full "
-                        f"{yrs:.1f} years of history instead.")
-            else:
-                step = round_step(last_px)
-                rounds = [(math.floor(last_px / step) - i) * step for i in range(3)]
-                rounds = [r for r in rounds if 0 < r < last_px]
-                st.warning(f"📉 {tkr} is trading below every swing low in {yrs:.1f} years of data "
-                           f"(low ${float(df_sr['Low'].min()):,.2f}), so there is no historical support "
-                           f"underneath. Traders often watch round numbers instead: "
-                           + ", ".join(f"${r:,.0f}" for r in rounds) + ".")
-        left, right = st.columns(2)
-        left.markdown("**Support (nearest first)**")
-        left.dataframe(sup, hide_index=True, use_container_width=True)
-        right.markdown("**Resistance (nearest first)**")
-        right.dataframe(res, hide_index=True, use_container_width=True)
-        st.plotly_chart(plot_levels(df_sr, sup, res, title=f"{tkr} support & resistance"),
-                        use_container_width=True)
-        st.divider()
