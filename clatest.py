@@ -614,20 +614,30 @@ with tabs[0]:
         col1.metric("Current Price", f"${pi['current']:,.2f}")
         col2.metric("52W High", f"${pi['hi52']:,.2f}")
         col3.metric("52W Low", f"${pi['lo52']:,.2f}")
+        # % below the 52-week high, shown in whichever card would otherwise be empty
+        hi52, cur = pi.get("hi52"), pi.get("current")
+        pct_from_high = (cur - hi52) / hi52 * 100 if hi52 and cur is not None else None
+
+        def show_from_high(col):
+            if pct_from_high is not None:
+                col.metric("From 52W High", f"{pct_from_high:+.2f}%",
+                           delta=f"{pct_from_high:+.2f}%")
+            else:
+                col.metric("From 52W High", "N/A")
+
         mkt_cap = pi.get("mkt_cap")
         if mkt_cap:
             col4.metric("Mkt Cap / AUM", fmt_mkt_cap(mkt_cap))
         else:
-            # Fallback when market cap isn't available: % below the 52-week high
-            hi52, cur = pi.get("hi52"), pi.get("current")
-            if hi52 and cur is not None:
-                pct_from_high = (cur - hi52) / hi52 * 100
-                col4.metric("From 52W High", f"{pct_from_high:+.2f}%",
-                            delta=f"{pct_from_high:+.2f}%")
-            else:
-                col4.metric("From 52W High", "N/A")
+            show_from_high(col4)
         col5.metric("YTD Return", ytd_str, delta=ytd_delta)
-        col6.metric("Expense Ratio", expense_str)
+        if expense_decimal is not None:
+            col6.metric("Expense Ratio", expense_str)
+        elif mkt_cap:
+            # Stocks have no expense ratio, so use this card for From 52W High
+            show_from_high(col6)
+        else:
+            col6.metric("Expense Ratio", "N/A")
 
         col_a, col_b = st.columns(2)
 
