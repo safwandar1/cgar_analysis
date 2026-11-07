@@ -579,7 +579,7 @@ st.title("Portfolio CAGR Analyzer")
 st.markdown("".join([f'<span class="ticker-tag">{t}</span>' for t in all_data]), unsafe_allow_html=True)
 
 # ── Create Tabs AFTER all data is loaded ──────────────────────────────────────
-tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance"])
+tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance", "🤖 AI Summary"])
 
 def fmt_mkt_cap(val):
     if val is None: return "N/A"
@@ -1174,3 +1174,254 @@ with tabs[7]:
         st.plotly_chart(plot_levels(df_sr, sup, res, title=f"{tkr} support & resistance"),
                         use_container_width=True)
         st.divider()
+
+# ── Tab 8: AI Summary (rule-based notes + "Copy for Claude" prompt) ────────────
+def _pct(a, b):
+    """Percent change from b to a, or None."""
+    try:
+        return (a / b - 1) * 100 if b else None
+    except Exception:
+        return None
+
+
+def build_snapshot(tkr, prices, pi):
+    """Collect the numbers used by both the rule-based notes and the Claude prompt."""
+    s = {"ticker": tkr, "name": pi.get("long_name") or tkr}
+    cur = float(pi["current"])
+    s["price"] = cur
+    s["hi52"], s["lo52"] = pi.get("hi52"), pi.get("lo52")
+    s["from_high"] = _pct(cur, s["hi52"])
+    s["above_low"] = _pct(cur, s["lo52"])
+    s["ytd"] = pi.get("ytd_return")
+    s["pe"] = pi.get("pe_ratio")
+    s["mkt_cap"] = pi.get("mkt_cap")
+    s["expense"] = pi.get("expense_ratio")
+
+    s["ma50"] = float(prices.rolling(50).mean().iloc[-1]) if len(prices) >= 50 else None
+    s["ma200"] = float(prices.rolling(200).mean().iloc[-1]) if len(prices) >= 200 else None
+    s["vs_ma50"] = _pct(cur, s["ma50"])
+    s["vs_ma200"] = _pct(cur, s["ma200"])
+
+    def ret_n(n):
+        return _pct(cur, float(prices.iloc[-n - 1])) if len(prices) > n else None
+    s["ret_1m"], s["ret_3m"], s["ret_1y"] = ret_n(21), ret_n(63), ret_n(252)
+
+    daily = prices.pct_change().dropna()
+    s["vol_30d"] = float(daily.iloc[-30:].std() * np.sqrt(252) * 100) if len(daily) >= 30 else None
+    s["vol_1y"] = float(daily.iloc[-252:].std() * np.sqrt(252) * 100) if len(daily) >= 60 else None
+
+    last_1y = prices.iloc[-252:]
+    s["max_dd_1y"] = float(((last_1y - last_1y.cummax()) / last_1y.cummax()).min() * 100)
+    s["sharpe_1y"] = ((s["ret_1y"] / 100 - 0.045) / (s["vol_1y"] / 100)
+                      if s["ret_1y"] is not None and s["vol_1y"] else None)
+
+    cagr_df = compute_cagr_df(prices, 10)
+    for n in (3, 5, 10):
+        row = cagr_df[cagr_df["n"] == n] if not cagr_df.empty else cagr_df
+        s[f"cagr_{n}y"] = float(row["cagr"].iloc[0]) if len(row) else None
+
+    # Nearest support / resistance from the Support/Resistance tab's logic
+    s["support"] = s["resistance"] = None
+    try:
+        ohlcv = fetch_ohlcv(tkr)
+        if ohlcv is not None and len(ohlcv) >= 60:
+            sup = find_levels(ohlcv, "support")
+            res = find_levels(ohlcv, "resistance")
+            sup = sup[sup["level"] < cur]
+            res = res[res["level"] > cur]
+            if not sup.empty:
+                s["support"] = (float(sup["level"].iloc[0]), sup["strength"].iloc[0])
+            if not res.empty:
+                s["resistance"] = (float(res["level"].iloc[0]), res["strength"].iloc[0])
+    except Exception:
+        pass
+    return s
+
+
+def rule_notes(s):
+    """Plain-English observations generated from fixed rules (no AI)."""
+    notes = []
+    cur = s["price"]
+
+    # Trend vs moving averages
+    if s["ma50"] and s["ma200"]:
+        if cur > s["ma50"] and cur > s["ma200"]:
+            notes.append(("🟢", f"Uptrend: price is above both the 50-day (${s['ma50']:,.2f}) and 200-day (${s['ma200']:,.2f}) averages."))
+        elif cur < s["ma50"] and cur < s["ma200"]:
+            notes.append(("🔴", f"Downtrend: price is below both the 50-day (${s['ma50']:,.2f}) and 200-day (${s['ma200']:,.2f}) averages."))
+        else:
+            notes.append(("🟡", f"Mixed trend: price is between the 50-day (${s['ma50']:,.2f}) and 200-day (${s['ma200']:,.2f}) averages."))
+        if s["ma50"] > s["ma200"]:
+            notes.append(("🟢", "50-day average is above the 200-day (longer-term trend still positive)."))
+        else:
+            notes.append(("🔴", "50-day average is below the 200-day (longer-term trend has turned negative)."))
+
+    # Distance from 52-week high
+    fh = s["from_high"]
+    if fh is not None:
+        if fh >= -5:
+            notes.append(("🟢", f"Near its 52-week high ({fh:+.1f}%)."))
+        elif fh >= -20:
+            notes.append(("🟡", f"Pullback: {fh:+.1f}% from its 52-week high of ${s['hi52']:,.2f}."))
+        elif fh >= -35:
+            notes.append(("🔴", f"Bear-market territory: {fh:+.1f}% from its 52-week high of ${s['hi52']:,.2f}."))
+        else:
+            notes.append(("🔴", f"Deep drawdown: {fh:+.1f}% from its 52-week high of ${s['hi52']:,.2f}. "
+                                 f"Needs {(-fh / (100 + fh)) * 100:+.0f}% to get back to the high."))
+
+    # Short-term momentum
+    if s["ret_1m"] is not None:
+        if s["ret_1m"] <= -10:
+            notes.append(("🔴", f"Sharp 1-month drop ({s['ret_1m']:+.1f}%)."))
+        elif s["ret_1m"] >= 10:
+            notes.append(("🟢", f"Strong 1-month gain ({s['ret_1m']:+.1f}%)."))
+
+    # Volatility regime
+    if s["vol_30d"] and s["vol_1y"]:
+        ratio = s["vol_30d"] / s["vol_1y"]
+        if ratio >= 1.3:
+            notes.append(("🟠", f"Volatility is elevated: 30-day {s['vol_30d']:.0f}% vs 1-year {s['vol_1y']:.0f}% (annualized)."))
+        elif ratio <= 0.8:
+            notes.append(("🟢", f"Volatility is calmer than usual: 30-day {s['vol_30d']:.0f}% vs 1-year {s['vol_1y']:.0f}%."))
+
+    # Support / resistance
+    if s["support"]:
+        lvl, strength = s["support"]
+        notes.append(("🛡️", f"Nearest support ≈ ${lvl:,.2f} ({_pct(lvl, cur):+.1f}% away, {strength})."))
+    else:
+        notes.append(("⚠️", "No historical support found below the current price in the last 2 years."))
+    if s["resistance"]:
+        lvl, strength = s["resistance"]
+        notes.append(("🧱", f"Nearest resistance ≈ ${lvl:,.2f} ({_pct(lvl, cur):+.1f}% away, {strength})."))
+
+    # Valuation (stocks only)
+    if s["pe"]:
+        if s["pe"] >= 40:
+            notes.append(("🟠", f"High P/E ({s['pe']:.1f}x): the price assumes strong future growth."))
+        elif s["pe"] <= 12:
+            notes.append(("🟡", f"Low P/E ({s['pe']:.1f}x). For cyclical companies (memory, autos, energy) "
+                                 "a low P/E can mean earnings are at a peak, not that the stock is cheap."))
+
+    # Risk-adjusted return
+    if s["sharpe_1y"] is not None:
+        tag = "🟢" if s["sharpe_1y"] >= 1 else "🟡" if s["sharpe_1y"] >= 0 else "🔴"
+        notes.append((tag, f"1-year Sharpe ratio: {s['sharpe_1y']:.2f}; max drawdown in the past year: {s['max_dd_1y']:.1f}%."))
+    return notes
+
+
+def _fmt(v, kind="pct"):
+    if v is None:
+        return "n/a"
+    if kind == "pct":
+        return f"{v:+.2f}%"
+    if kind == "usd":
+        return f"${v:,.2f}"
+    if kind == "num":
+        return f"{v:.2f}"
+    return str(v)
+
+
+def build_claude_prompt(snaps, analysis_type, question, corr_note):
+    lines = [
+        "You are a careful, skeptical equity analyst. Use the data below (from my own app, "
+        f"as of {datetime.today().strftime('%Y-%m-%d')}) plus the latest earnings and news you can find. "
+        "Be specific, explain your reasoning, separate facts from opinion, and say what would change your view. "
+        "Do not just tell me to buy or sell; give me what I need to decide.",
+        "",
+        f"ANALYSIS REQUESTED: {analysis_type}",
+        "",
+        "DATA:",
+    ]
+    for s in snaps:
+        exp_str = f"{s['expense'] * 100:.3f}%" if s["expense"] else "n/a"
+        pe_str = f"{s['pe']:.2f}" if s["pe"] else "n/a"
+        sup = f"${s['support'][0]:,.2f} ({s['support'][1]})" if s["support"] else "none found"
+        res = f"${s['resistance'][0]:,.2f} ({s['resistance'][1]})" if s["resistance"] else "none found"
+        lines += [
+            f"- {s['ticker']} ({s['name']})",
+            f"  Price {_fmt(s['price'], 'usd')} | 52W high {_fmt(s['hi52'], 'usd')} ({_fmt(s['from_high'])}) | "
+            f"52W low {_fmt(s['lo52'], 'usd')} ({_fmt(s['above_low'])})",
+            f"  Returns: 1M {_fmt(s['ret_1m'])} | 3M {_fmt(s['ret_3m'])} | YTD {_fmt(s['ytd'])} | 1Y {_fmt(s['ret_1y'])}",
+            f"  CAGR: 3Y {_fmt(s['cagr_3y'])} | 5Y {_fmt(s['cagr_5y'])} | 10Y {_fmt(s['cagr_10y'])}",
+            f"  50-day MA {_fmt(s['ma50'], 'usd')} ({_fmt(s['vs_ma50'])}) | 200-day MA {_fmt(s['ma200'], 'usd')} ({_fmt(s['vs_ma200'])})",
+            f"  Volatility (ann.): 30-day {_fmt(s['vol_30d'], 'num')}% | 1-year {_fmt(s['vol_1y'], 'num')}% | "
+            f"1Y Sharpe {_fmt(s['sharpe_1y'], 'num')} | 1Y max drawdown {_fmt(s['max_dd_1y'])}",
+            f"  Nearest support {sup} | Nearest resistance {res}",
+            f"  P/E {pe_str} | Market cap/AUM {fmt_mkt_cap(s['mkt_cap'])} | Expense ratio {exp_str}",
+        ]
+    if corr_note:
+        lines += ["", "CORRELATION (daily returns, past year):", corr_note]
+
+    focus = {
+        "Full analysis": "Cover trend, risk, technical levels, valuation, recent earnings/news, and key risks for each ticker.",
+        "Market analysis": "Focus on current trends, recent earnings, sector news, and emerging patterns for each ticker.",
+        "Risk management": "Focus on downside risk: volatility, drawdowns, position sizing, and where a stop-loss or add-on level could make sense using the support levels.",
+        "Technical analysis": "Focus on price vs moving averages, momentum, support/resistance, and what the chart suggests in the near term.",
+        "Portfolio diversification": "Treat these tickers as one portfolio: identify overlap and concentration (sectors, top holdings), and suggest ways to diversify.",
+    }[analysis_type]
+    lines += ["", "FOCUS: " + focus]
+    if question.strip():
+        lines += ["", "MY QUESTION / CONTEXT: " + question.strip()]
+    lines += ["", "End with a short summary table: ticker, condition, main risk, what to watch next."]
+    return "\n".join(lines)
+
+
+with tabs[8]:
+    st.subheader("🤖 AI Summary")
+    st.caption("The quick notes come from fixed rules applied to the app's own data (free, no AI). "
+               "For a deeper analysis, copy the prompt below and paste it into Claude. "
+               "Neither is financial advice.")
+
+    snaps = []
+    for tkr, d in all_data.items():
+        with st.spinner(f"Building summary for {tkr}…"):
+            snaps.append(build_snapshot(tkr, d["prices"], d["info"]))
+
+    # ── Option 2: rule-based notes ────────────────────────────────────────────
+    st.markdown("### 📋 Quick notes")
+    for s in snaps:
+        with st.container(border=True):
+            st.markdown(f"**{s['ticker']}** — {s['name']}  ·  ${s['price']:,.2f}")
+            for icon, text in rule_notes(s):
+                st.markdown(f"{icon} {text}")
+
+    # Portfolio overlap when several tickers are entered
+    corr_note = ""
+    if len(all_data) > 1:
+        rets = pd.DataFrame({t: d["prices"].pct_change() for t, d in all_data.items()}).iloc[-252:].dropna()
+        if len(rets) > 30:
+            corr = rets.corr()
+            pairs = []
+            cols = list(corr.columns)
+            for i in range(len(cols)):
+                for j in range(i + 1, len(cols)):
+                    pairs.append((cols[i], cols[j], float(corr.iloc[i, j])))
+            pairs.sort(key=lambda x: -x[2])
+            corr_note = "\n".join(f"{a}–{b}: {c:.2f}" for a, b, c in pairs)
+            st.markdown("### 🧩 Portfolio overlap")
+            high = [p for p in pairs if p[2] >= 0.85]
+            if high:
+                for a, b, c in high:
+                    st.markdown(f"🟠 **{a} & {b}** move almost together (correlation {c:.2f}), so holding both adds little diversification.")
+            else:
+                st.markdown("🟢 No pair moves almost identically (all correlations below 0.85).")
+            st.plotly_chart(px.imshow(corr.round(2), text_auto=True, color_continuous_scale="RdYlGn_r",
+                                      zmin=-1, zmax=1, title="Correlation of daily returns (past year)"),
+                            use_container_width=True)
+
+    # ── Option 1: copy-ready prompt for Claude ────────────────────────────────
+    st.markdown("### 📎 Copy for Claude")
+    c1, c2 = st.columns([1, 2])
+    analysis_type = c1.selectbox("Analysis type", ["Full analysis", "Market analysis", "Risk management",
+                                                   "Technical analysis", "Portfolio diversification"],
+                                 key="ai_analysis_type")
+    question = c2.text_input("Your question or context (optional)",
+                             placeholder="e.g. I hold this in my IRA with a 15-year horizon. Is it worth adding here?",
+                             key="ai_question")
+    prompt = build_claude_prompt(snaps, analysis_type, question, corr_note)
+    st.caption("Click the copy icon in the top-right corner of the box, then paste it into a new Claude chat.")
+    try:
+        st.code(prompt, language=None, wrap_lines=True)
+    except TypeError:  # older Streamlit without wrap_lines
+        st.code(prompt, language=None)
+    st.link_button("Open Claude ↗", "https://claude.ai/new")
