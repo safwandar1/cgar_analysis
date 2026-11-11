@@ -453,6 +453,21 @@ def find_levels(
             "sources": [f"swing {'lows' if kind == 'support' else 'highs'}"],
         })
 
+    # 1b) recent extreme the swing test can't confirm yet (last `window` bars)
+    col = "Low" if kind == "support" else "High"
+    tail = data[col].iloc[-window:]
+    prior = data[col].iloc[-(2 * window + 1):-window]
+    rec_date = tail.idxmin() if kind == "support" else tail.idxmax()
+    rec_price = float(tail.loc[rec_date])
+    is_extreme = rec_price <= prior.min() if kind == "support" else rec_price >= prior.max()
+    if (is_extreme and on_correct_side(rec_price)
+            and not any(abs(rec_price - r["level"]) / rec_price <= tol_pct for r in rows)):
+        rows.append({
+            "level": rec_price, "zone_low": rec_price, "zone_high": rec_price,
+            "touches": 1, "last_touch": rec_date,
+            "sources": [f"recent {'low' if kind == 'support' else 'high'} (unconfirmed)"],
+        })
+
     # 2) high-volume price levels not already covered by a swing zone
     for _, node in nodes.iterrows():
         level = float(node["price"])
@@ -505,7 +520,8 @@ def find_levels(
     out["strength"] = pd.cut(out["score"], bins=[-np.inf, 2.5, 4.0, np.inf],
                              labels=["weak", "moderate", "strong"]).astype(str)
     out["sources"] = out["sources"].apply(lambda s: ", ".join(dict.fromkeys(s)))
-    out = out[out["score"] >= min_score]
+    # keep the unconfirmed recent extreme even if its score is still low
+    out = out[(out["score"] >= min_score) | out["sources"].str.contains("unconfirmed")]
     out = out.sort_values("level", ascending=(kind == "resistance")).head(max_levels)
     cols = ["level", "zone_low", "zone_high", "distance_pct", "touches",
             "last_touch", "score", "strength", "sources"]
@@ -1125,7 +1141,8 @@ def fetch_ohlcv(ticker):
 
 with tabs[7]:
     st.caption("Zones come from swing points, volume profile, 50/200-day averages and round numbers. "
-               "They show where buyers or sellers stepped in before, not a guarantee.")
+               "They show where buyers or sellers stepped in before, not a guarantee. "
+               "Rows marked \"unconfirmed\" are recent lows/highs that haven't had enough bars after them to confirm yet.")
     c1, c2 = st.columns(2)
     sr_window = c1.slider("Swing confirmation (bars each side)", 3, 15, 5, key="sr_window")
     sr_tol = c2.slider("Zone width (%)", 0.5, 4.0, 1.5, 0.25, key="sr_tol") / 100
