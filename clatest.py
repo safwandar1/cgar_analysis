@@ -595,7 +595,7 @@ st.title("Portfolio CAGR Analyzer")
 st.markdown("".join([f'<span class="ticker-tag">{t}</span>' for t in all_data]), unsafe_allow_html=True)
 
 # ── Create Tabs AFTER all data is loaded ──────────────────────────────────────
-tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance", "🤖 AI Summary"])
+tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance", "🤖 AI Summary", "🧮 Options IV"])
 
 def fmt_mkt_cap(val):
     if val is None: return "N/A"
@@ -1442,3 +1442,230 @@ with tabs[8]:
     except TypeError:  # older Streamlit without wrap_lines
         st.code(prompt, language=None)
     st.link_button("Open Claude ↗", "https://claude.ai/new")
+
+
+# ── Tab 9: Options IV calculator ───────────────────────────────────────────────
+from statistics import NormalDist
+from datetime import time as dtime
+
+_N = NormalDist()
+
+
+def bs_price(kind, S, K, T, vol, r=0.04, q=0.0):
+    """Black-Scholes price of a European call or put (dividend yield q)."""
+    if T <= 0 or vol <= 0:
+        return max(0.0, S - K) if kind == "call" else max(0.0, K - S)
+    sq = vol * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + vol * vol / 2) * T) / sq
+    d2 = d1 - sq
+    if kind == "call":
+        return S * math.exp(-q * T) * _N.cdf(d1) - K * math.exp(-r * T) * _N.cdf(d2)
+    return K * math.exp(-r * T) * _N.cdf(-d2) - S * math.exp(-q * T) * _N.cdf(-d1)
+
+
+def bs_greeks(kind, S, K, T, vol, r=0.04, q=0.0):
+    """Delta, gamma, theta (per calendar day) and vega (per 1 IV point), per share."""
+    sq = vol * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + vol * vol / 2) * T) / sq
+    d2 = d1 - sq
+    pdf, eq, er = _N.pdf(d1), math.exp(-q * T), math.exp(-r * T)
+    gamma = eq * pdf / (S * sq)
+    vega = S * eq * pdf * math.sqrt(T) / 100
+    decay = -S * eq * pdf * vol / (2 * math.sqrt(T))
+    if kind == "call":
+        delta = eq * _N.cdf(d1)
+        theta = (decay - r * K * er * _N.cdf(d2) + q * S * eq * _N.cdf(d1)) / 365
+    else:
+        delta = eq * (_N.cdf(d1) - 1)
+        theta = (decay + r * K * er * _N.cdf(-d2) - q * S * eq * _N.cdf(-d1)) / 365
+    return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+
+
+def implied_vol(kind, price, S, K, T, r=0.04, q=0.0):
+    """Volatility that makes the Black-Scholes price match `price` (bisection).
+
+    Returns None if no volatility between 0.1% and 1000% fits, e.g. a price
+    below intrinsic value or a stale quote.
+    """
+    if price <= 0 or T <= 0:
+        return None
+    lo, hi = 0.001, 10.0
+    if price < bs_price(kind, S, K, T, lo, r, q) or price > bs_price(kind, S, K, T, hi, r, q):
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if bs_price(kind, S, K, T, mid, r, q) > price:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def years_to_expiry(exp_date):
+    """Time left until the 4:00 PM ET close (3:00 PM Central) on expiration day, in years."""
+    expiry = datetime.combine(exp_date, dtime(15, 0))
+    seconds = (expiry - datetime.now()).total_seconds()
+    return max(seconds, 3600) / (365 * 24 * 3600)  # floor at 1 hour
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_spot(ticker):
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        return float(hist["Close"].dropna().iloc[-1]) if not hist.empty else None
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_expirations(ticker):
+    try:
+        return list(yf.Ticker(ticker).options)
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_chain(ticker, expiration):
+    chain = yf.Ticker(ticker).option_chain(expiration)
+    return chain.calls.copy(), chain.puts.copy()
+
+
+def _parse_numbers(text):
+    out = []
+    for part in text.replace(";", ",").split(","):
+        try:
+            out.append(float(part.strip()))
+        except ValueError:
+            pass
+    return out
+
+
+with tabs[9]:
+    st.subheader("🧮 Options IV Calculator")
+    st.caption("Implied volatility is worked backward from the option's price using the Black-Scholes model. "
+               "Brokers can show slightly different numbers because they use different prices (mark vs. last), "
+               "interest rates or models. Estimates only, not advice.")
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    iv_ticker = c1.text_input("Ticker", value=list(all_data)[0], key="iv_ticker").strip().upper()
+    kind = c2.radio("Option type", ["put", "call"], horizontal=True, key="iv_kind")
+    spot_live = fetch_spot(iv_ticker) or 100.0
+    S = c3.number_input("Stock price ($)", value=round(spot_live, 2), min_value=0.01, step=0.5,
+                        key=f"iv_spot_{iv_ticker}", help="Defaults to the last price; change it to test a scenario.")
+
+    c4, c5, c6 = st.columns(3)
+    K = c4.number_input("Strike ($)", value=float(round(S)), min_value=0.01, step=1.0, key=f"iv_strike_{iv_ticker}")
+    exp_date = c5.date_input("Expiration", value=datetime.today().date() + timedelta(days=30), key="iv_exp")
+    opt_price = c6.number_input("Option price / mark ($ per share)", value=1.00, min_value=0.01,
+                                step=0.05, format="%.2f", key="iv_price")
+
+    c7, c8 = st.columns(2)
+    r = c7.number_input("Risk-free rate (%)", value=4.0, step=0.25, key="iv_r") / 100
+    q = c8.number_input("Dividend yield (%)", value=0.0, step=0.25, key="iv_q") / 100
+
+    T = years_to_expiry(exp_date)
+    days_left = T * 365
+    iv = implied_vol(kind, opt_price, S, K, T, r, q)
+
+    if iv is None:
+        intrinsic = max(0.0, (S - K) if kind == "call" else (K - S))
+        st.warning(f"No volatility fits that price. The option price must be above its intrinsic value "
+                   f"(${intrinsic:,.2f}) and realistic for {days_left:.1f} days left. Check the inputs.")
+    else:
+        g = bs_greeks(kind, S, K, T, iv, r, q)
+        breakeven = K - opt_price if kind == "put" else K + opt_price
+        m = st.columns(6)
+        m[0].metric("Implied volatility", f"{iv * 100:.1f}%")
+        m[1].metric("Delta", f"{g['delta']:+.3f}")
+        m[2].metric("Gamma", f"{g['gamma']:.4f}")
+        m[3].metric("Theta / day", f"${g['theta'] * 100:+,.2f}", help="Per contract (100 shares), from time passing")
+        m[4].metric("Vega / 1 IV pt", f"${g['vega'] * 100:,.2f}", help="Per contract, for a 1-point change in IV")
+        m[5].metric("Breakeven at expiry", f"${breakeven:,.2f}",
+                    delta=f"{(breakeven / S - 1) * 100:+.1f}% from now", delta_color="off")
+        st.caption(f"{days_left:.1f} days to expiration · cost per contract ${opt_price * 100:,.0f} · "
+                   f"rough chance of finishing in the money ≈ {abs(g['delta']) * 100:.0f}% (from delta)")
+
+        # ── Scenario table ────────────────────────────────────────────────────
+        st.markdown("### 📐 What-if table")
+        st.caption("Estimated option price at a future date for different stock prices and IV levels.")
+        s1, s2, s3 = st.columns(3)
+        max_day = max(int(days_left), 0)
+        days_ahead = s1.slider("Days from now", 0, max_day, min(max_day, max(max_day - 2, 0)),
+                               key="iv_days_ahead") if max_day > 0 else 0
+        default_prices = sorted({round(K * f, 2) for f in (0.875, 0.95, 1.0, 1.05, 1.125)} | {round(S, 2)})
+        prices_txt = s2.text_input("Stock prices to test", ", ".join(f"{p:g}" for p in default_prices),
+                                   key=f"iv_prices_{iv_ticker}_{K}")
+        ivs_txt = s3.text_input("IV levels to test (%)",
+                                ", ".join(f"{v:.0f}" for v in (iv * 50, iv * 75, iv * 100)), key=f"iv_levels_{round(iv, 3)}")
+        test_prices = sorted(p for p in _parse_numbers(prices_txt) if p > 0)
+        test_ivs = [v / 100 for v in _parse_numbers(ivs_txt) if v > 0]
+        T_future = max(T - days_ahead / 365, 1 / (365 * 24))
+
+        if test_prices and test_ivs:
+            rows = []
+            for p in test_prices:
+                row = {"Stock price": f"${p:,.2f}"}
+                for v in test_ivs:
+                    val = bs_price(kind, p, K, T_future, v, r, q)
+                    row[f"IV {v * 100:.0f}%"] = f"${val:,.2f}  ({(val - opt_price) * 100:+,.0f})"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.caption("Each cell: option price per share, and in brackets the profit/loss per contract vs. "
+                       f"today's ${opt_price:.2f}. IV usually drops after earnings (\"IV crush\").")
+
+    # ── Option chain and IV skew ──────────────────────────────────────────────
+    st.markdown("### 📈 IV across strikes (skew)")
+    exps = fetch_expirations(iv_ticker)
+    if not exps:
+        st.info(f"No option chain available for {iv_ticker} from Yahoo Finance.")
+    else:
+        chain_exp = st.selectbox("Expiration", exps, key=f"iv_chain_exp_{iv_ticker}")
+        if st.checkbox("📥 Load chain", key="iv_load_chain",
+                       help="Stays on across the 60-second auto-refresh until you untick it."):
+            try:
+                calls, puts = fetch_chain(iv_ticker, chain_exp)
+            except Exception as e:
+                st.warning(f"Could not load the chain: {e}")
+            else:
+                T_chain = years_to_expiry(datetime.strptime(chain_exp, "%Y-%m-%d").date())
+                spot_now = fetch_spot(iv_ticker) or S
+                frames = []
+                for label, df in (("call", calls), ("put", puts)):
+                    if df.empty:
+                        continue
+                    df = df.copy()
+                    df["type"] = label
+                    has_quote = (df["bid"] > 0) & (df["ask"] > 0)
+                    df["mid"] = np.where(has_quote, (df["bid"] + df["ask"]) / 2, df["lastPrice"])
+                    df["my_iv"] = [implied_vol(label, m_, spot_now, k_, T_chain, r, q)
+                                   for m_, k_ in zip(df["mid"], df["strike"])]
+                    frames.append(df)
+                chain_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["strike", "my_iv"])
+                # keep strikes within ±40% of the stock price so the chart stays readable
+                chain_df = chain_df[(chain_df["strike"] >= spot_now * 0.6) & (chain_df["strike"] <= spot_now * 1.4)]
+                plot_df = chain_df.dropna(subset=["my_iv"])
+                if plot_df.empty:
+                    st.info("No usable quotes for this expiration (market may be closed or quotes stale).")
+                else:
+                    fig_iv = go.Figure()
+                    for label, color in (("put", "#b91c1c"), ("call", "#0d5c32")):
+                        part = plot_df[plot_df["type"] == label]
+                        fig_iv.add_trace(go.Scatter(x=part["strike"], y=part["my_iv"] * 100, mode="lines+markers",
+                                                    name=f"{label}s", line=dict(color=color)))
+                    fig_iv.add_vline(x=spot_now, line_dash="dot", line_color="#555",
+                                     annotation_text=f"stock ${spot_now:,.2f}")
+                    fig_iv.update_layout(title=f"{iv_ticker} implied volatility by strike · expires {chain_exp}",
+                                         xaxis_title="Strike", yaxis_title="Implied volatility (%)",
+                                         yaxis_ticksuffix="%", template="plotly_white")
+                    st.plotly_chart(fig_iv, use_container_width=True)
+                    st.caption("Out-of-the-money puts usually show higher IV than calls: people pay extra for "
+                               "crash protection. That tilt is the \"skew\".")
+                    table = plot_df[["type", "strike", "bid", "ask", "mid", "my_iv", "impliedVolatility",
+                                     "volume", "openInterest"]].rename(columns={
+                        "my_iv": "My IV", "impliedVolatility": "Yahoo IV", "openInterest": "Open interest"})
+                    table["My IV"] = (table["My IV"] * 100).round(1)
+                    table["Yahoo IV"] = (table["Yahoo IV"] * 100).round(1)
+                    st.dataframe(table.sort_values(["type", "strike"]), hide_index=True,
+                                 use_container_width=True, height=420)
