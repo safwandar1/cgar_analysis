@@ -664,6 +664,10 @@ with tabs[0]:
         with col_a:
             if r_cagr is not None:
                 color = "#0d5c32" if r_cagr >= 0 else "#b91c1c"
+                # Actual growth over the real (not rounded) window
+                growth_mult = r_to / r_from
+                actual_years = (r_dt_to - r_dt_from).days / 365.25
+                actual_end_val = investment * growth_mult
                 st.markdown(f"""
                 <div style="background:white; border:1.5px solid #c3e8d0; border-radius:18px; padding:25px; margin:10px 0;">
                     <div style="font-size:0.7rem; text-transform:uppercase; color:#4a7c5f;">📅 Historical CAGR · {range_label}</div>
@@ -671,7 +675,10 @@ with tabs[0]:
                     <div style="margin-top:12px; font-size:0.82rem; color:#555;">
                         <b>From</b> ${r_from:,.2f} ({r_dt_from.strftime('%b %Y')}) → <b>To</b> ${r_to:,.2f} ({r_dt_to.strftime('%b %Y')})
                     </div>
-                    <div style="margin-top:8px; font-size:0.8rem; color:#888;">{span_years}-year window</div>
+                    <div style="margin-top:6px; font-size:0.82rem; color:#555;">
+                        <b>Actual growth:</b> $1 → ${growth_mult:,.2f} ({growth_mult:,.1f}×) · ${investment:,.0f} → ${actual_end_val:,.0f}
+                    </div>
+                    <div style="margin-top:8px; font-size:0.8rem; color:#888;">{span_years}-year window (actual {actual_years:.1f} years)</div>
                 </div>
                 """, unsafe_allow_html=True)
             elif r_from is not None:
