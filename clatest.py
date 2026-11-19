@@ -595,7 +595,7 @@ st.title("Portfolio CAGR Analyzer")
 st.markdown("".join([f'<span class="ticker-tag">{t}</span>' for t in all_data]), unsafe_allow_html=True)
 
 # ── Create Tabs AFTER all data is loaded ──────────────────────────────────────
-tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance", "🤖 AI Summary", "🧮 Options IV"])
+tabs = st.tabs(["📊 CAGR Hero", "📅 Annual Returns", "💰 Growth Chart", "🚀 Future Comparison", "⚡ Volatility & Sharpe", "📉 Drawdown", "🔍 Sharpe Screener", "🎯 Support/Resistance", "🤖 AI Summary", "🧮 Options IV", "📋 Yearly % Table"])
 
 def fmt_mkt_cap(val):
     if val is None: return "N/A"
@@ -1669,3 +1669,99 @@ with tabs[9]:
                     table["Yahoo IV"] = (table["Yahoo IV"] * 100).round(1)
                     st.dataframe(table.sort_values(["type", "strike"]), hide_index=True,
                                  use_container_width=True, height=420)
+
+
+# ── Tab 10: Yearly % Table ──────────────────────────────────────────────────────
+def compute_yearly_returns(prices):
+    """
+    Calendar-year % return for each year in the price series.
+    Uses prior year's LAST close → this year's LAST close (the standard way).
+    The first year in the data has no prior year-end, so it falls back to that
+    year's first close and is flagged as partial. The current year is YTD.
+    Returns {year: (return_pct, is_partial)}.
+    """
+    year_end = prices.groupby(prices.index.year).last()
+    year_start = prices.groupby(prices.index.year).first()
+    out = {}
+    years = list(year_end.index)
+    for i, y in enumerate(years):
+        if i == 0:
+            base, partial = float(year_start[y]), True
+        else:
+            base, partial = float(year_end[years[i - 1]]), False
+        if base > 0:
+            out[int(y)] = ((float(year_end[y]) / base - 1) * 100, partial)
+    return out
+
+with tabs[10]:
+    st.subheader("Calendar-Year Returns (%)")
+    st.caption(
+        "Each year = previous year's last close → that year's last close. "
+        f"{today_year} is year-to-date. Includes dividends (yfinance adjusted prices = total return). "
+        "To see older years, raise **Max Lookback** in the sidebar."
+    )
+
+    yearly = {tkr: compute_yearly_returns(d["prices"]) for tkr, d in all_data.items()}
+    all_years = sorted({y for r in yearly.values() for y in r}, reverse=True)
+
+    rows, partial_cells = [], set()
+    for y in all_years:
+        label = f"{y} (YTD)" if y == today_year else str(y)
+        row = {"Year": label}
+        for tkr, r in yearly.items():
+            if y in r:
+                ret, partial = r[y]
+                row[tkr] = ret
+                if partial:
+                    partial_cells.add((label, tkr))
+            else:
+                row[tkr] = np.nan
+        rows.append(row)
+
+    df_yr = pd.DataFrame(rows).set_index("Year")
+
+    # Summary rows use full calendar years only (skip YTD and partial first year)
+    full = df_yr.copy()
+    for (label, tkr) in partial_cells:
+        full.loc[label, tkr] = np.nan
+    full = full.drop(index=[i for i in full.index if "YTD" in i], errors="ignore")
+
+    summary = pd.DataFrame({
+        "Average": full.mean(),
+        "Best": full.max(),
+        "Worst": full.min(),
+        "% Up Years": (full > 0).sum() / full.notna().sum() * 100,
+    }).T
+
+    def color_ret(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "color:#0d5c32; font-weight:600"
+        if val < 0:
+            return "color:#b91c1c; font-weight:600"
+        return ""
+
+    st.dataframe(
+        df_yr.style.map(color_ret).format("{:+.2f}%", na_rep="—"),
+        use_container_width=True,
+        height=min(38 * (len(df_yr) + 1), 800),
+    )
+    if partial_cells:
+        st.caption("⚠️ Partial first year (no prior year-end in the data): " +
+                   ", ".join(f"{t} {l}" for l, t in sorted(partial_cells)))
+
+    st.markdown("**Summary (full calendar years only)**")
+    st.dataframe(
+        summary.style.map(color_ret).format("{:.2f}", na_rep="—")
+        .format("{:+.2f}%", subset=pd.IndexSlice[["Average", "Best", "Worst"], :], na_rep="—")
+        .format("{:.0f}%", subset=pd.IndexSlice[["% Up Years"], :], na_rep="—"),
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "⬇ Download yearly returns as CSV",
+        data=df_yr.round(2).to_csv(),
+        file_name=f"yearly_returns_{datetime.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
