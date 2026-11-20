@@ -559,7 +559,9 @@ with st.sidebar:
     st.header("📈 Settings")
     t_input = st.text_input("Tickers", "VGT")
     investment = st.number_input("Investment ($)", value=100000)
-    lookback = st.slider("Max Lookback", 3, 20, 15)
+    # 30 years reaches back to the mid-1990s (e.g. 2000 dot-com crash, 2008).
+    # Funds only show data from their launch date (QQQ: March 1999).
+    lookback = st.slider("Max Lookback", 3, 30, 15)
     st.markdown("**CAGR Range** (years ago)")
     st.caption("Drag both ends to compare any two periods")
     horizon_range = st.select_slider(
